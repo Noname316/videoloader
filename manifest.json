@@ -1,8 +1,8 @@
 {
     "manifest_version": 3,
     "name": "VideoLoader",
-    "version": "0.1.0",
-    "description": "Скачивает видео с открытой страницы: HLS-потоки (m3u8) и обычные видеофайлы.",
+    "version": "0.2.0",
+    "description": "Скачивает видео с открытой страницы: HLS-потоки (m3u8), DASH и обычные видеофайлы.",
     "minimum_chrome_version": "116",
     "background": {
         "service_worker": "background.js",

@@ -1,11 +1,13 @@
 {
     "name": "videoloader",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "private": true,
-    "description": "Браузерное расширение: скачивание видео с открытой страницы (HLS и обычные файлы)",
+    "description": "Браузерное расширение: скачивание видео с открытой страницы (HLS, DASH и обычные файлы), Chrome и Firefox",
     "type": "module",
     "scripts": {
+        "build": "node tests/build.mjs",
         "e2e": "node tests/e2e.mjs",
+        "e2e:firefox": "node tests/e2e.mjs --browser firefox",
         "icons": "node tests/make-icons.mjs"
     },
     "devDependencies": {

@@ -16,18 +16,23 @@
 // должно показать одну строку (без кусков), скачать и склеить видео со звуком в MP4.
 // Готовые файлы проверяются воспроизведением в Chrome: длительность, кадр, звук.
 //
-// Запуск: node tests/e2e.mjs [--headful] [--segments 4] [--screenshot popup.png]
-// Нужны: puppeteer-core (npm i puppeteer-core или PUPPETEER_PATH) и Chrome (CHROME_PATH).
+// Запуск: node tests/e2e.mjs [--browser chrome|firefox] [--headful] [--segments 4] [--screenshot popup.png]
+// Нужны: puppeteer-core (npm i puppeteer-core или PUPPETEER_PATH) и Chrome (CHROME_PATH)
+// или Firefox (FIREFOX_PATH). Для Firefox тест сначала собирает dist/firefox (tests/build.mjs)
+// и управляет браузером через Marionette (tests/marionette.mjs), а не через puppeteer.
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
+import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { buildDashFixture } from './dash-fixture.mjs';
+import { launchFirefox } from './marionette.mjs';
 
 const { values: args } = parseArgs({
     options: {
+        browser: { type: 'string', default: 'chrome' },
         headful: { type: 'boolean', default: false },
         segments: { type: 'string', default: '4' },
         puppeteer: { type: 'string', default: process.env.PUPPETEER_PATH || 'puppeteer-core' },
@@ -40,8 +45,15 @@ const REMOTE = 'https://test-streams.mux.dev/x36xhzz/';
 const SEGMENTS = Number(args.segments);
 const puppeteerPath = fs.existsSync(args.puppeteer) ? pathToFileURL(path.resolve(args.puppeteer, 'lib/esm/puppeteer/puppeteer-core.js')).href : args.puppeteer;
 const { default: puppeteer } = await import(puppeteerPath);
-const extPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const FIREFOX = args.browser === 'firefox';
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+if (FIREFOX) execFileSync(process.execPath, [path.join(root, 'tests/build.mjs')], { stdio: 'inherit' });
+const extPath = FIREFOX ? path.join(root, 'dist/firefox') : root;
 const chrome = process.env.CHROME_PATH || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
+const firefox = process.env.FIREFOX_PATH || 'C:/Program Files/Mozilla Firefox/firefox.exe';
+/** Firefox даёт расширению случайный UUID адресов moz-extension:// — задаём свой. */
+const FIREFOX_ID = 'videoloader@noname316';
+const FIREFOX_UUID = '5c1d7e2a-0b0e-4f6d-9a51-3f0c1e2d4b60';
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'videoloader-e2e-'));
 const profile = path.join(tmp, 'profile');
 const downloads = path.join(tmp, 'downloads');
@@ -199,33 +211,62 @@ const server6 = http.createServer((req, res) => server.emit('request', req, res)
 await new Promise(r => server6.listen(port, '::1', r).on('error', () => r()));
 
 // --- Браузер ------------------------------------------------------------------------
-const browser = await puppeteer.launch({
-    executablePath: chrome,
-    headless: !args.headful,
-    userDataDir: profile,
-    pipe: true,
-    enableExtensions: true,
-    args: ['--no-first-run', '--no-default-browser-check']
-});
+const browser = FIREFOX
+    ? await launchFirefox({
+        executablePath: firefox,
+        headless: !args.headful,
+        prefs: {
+            'browser.download.dir': downloads,
+            'browser.download.folderList': 2,
+            'browser.download.useDownloadDir': true,
+            'browser.download.alwaysOpenPanel': false,
+            'media.autoplay.default': 0,
+            // Вкладки теста открываются в фоне, а там Firefox видео не декодирует.
+            'media.suspend-background-video.enabled': false,
+            'media.block-autoplay-until-in-foreground': false,
+            'extensions.webextensions.uuids': JSON.stringify({ [FIREFOX_ID]: FIREFOX_UUID })
+        }
+    })
+    : await puppeteer.launch({
+        executablePath: chrome,
+        headless: !args.headful,
+        userDataDir: profile,
+        pipe: true,
+        enableExtensions: true,
+        args: ['--no-first-run', '--no-default-browser-check']
+    });
 
 let failed = false;
 try {
     const extId = await browser.installExtension(extPath);
-    console.log('extension id:', extId);
-    const worker = await (await browser.waitForTarget(t => t.type() === 'service_worker' && t.url().includes(extId))).worker();
+    console.log(`${FIREFOX ? 'Firefox' : 'Chrome'}, extension id:`, extId);
+    const extBase = FIREFOX ? `moz-extension://${FIREFOX_UUID}` : `chrome-extension://${extId}`;
+    // Где выполнять вызовы API расширения: в Chrome — service worker фона, в Firefox
+    // (фон — страница, к ней не подключиться) — отдельная вкладка со страницей расширения.
+    let worker;
+    if (FIREFOX) {
+        worker = await browser.openExtensionPage(`${extBase}/popup.html?tabId=0`);
+    } else {
+        worker = await (await browser.waitForTarget(t => t.type() === 'service_worker' && t.url().includes(extId))).worker();
+    }
 
     const page = await browser.newPage();
     await page.goto(pageUrl());
     await page.waitForSelector('body[data-ready="1"]', { timeout: 30000 });
-    const tabId = await worker.evaluate(async () => (await chrome.tabs.query({ url: 'http://localhost/*' }))[0]?.id);
-    const found = await worker.evaluate(async id => (await chrome.storage.session.get(`tab:${id}`))[`tab:${id}`], tabId);
+    const tabId = await worker.evaluate(async () => (await (globalThis.browser ?? chrome).tabs.query({ url: 'http://localhost/*' }))[0]?.id);
+    const found = await worker.evaluate(async id => (await (globalThis.browser ?? chrome).storage.session.get(`tab:${id}`))[`tab:${id}`], tabId);
     console.log('найдено фоном:', found?.map(m => `${m.kind} ${m.url} referer=${m.headers.Referer}`));
     if (found?.length !== 2) throw new Error('фон должен был найти 2 плейлиста (мастер и вариант)');
 
-    const popup = await browser.newPage();
-    popup.on('console', m => console.log('  popup:', m.text()));
-    popup.on('pageerror', e => console.log('POPUP ERROR', e.message));
-    await popup.goto(`chrome-extension://${extId}/popup.html?tabId=${tabId}`);
+    let popup;
+    if (FIREFOX) {
+        popup = await browser.openExtensionPage(`${extBase}/popup.html?tabId=${tabId}`);
+    } else {
+        popup = await browser.newPage();
+        popup.on('console', m => console.log('  popup:', m.text()));
+        popup.on('pageerror', e => console.log('POPUP ERROR', e.message));
+        await popup.goto(`${extBase}/popup.html?tabId=${tabId}`);
+    }
     await popup.waitForSelector('#media .card select', { timeout: 30000 });
     const cards = await popup.$$eval('#media .card', els => els.map(e => e.innerText.replace(/\n/g, ' | ')));
     console.log('карточки:', cards);
@@ -276,10 +317,15 @@ try {
             v.currentTime = v.duration * 0.6;
             await new Promise(r => { v.onseeked = r; });
             await new Promise(r => setTimeout(r, 1000));
-            return { duration: v.duration, width: v.videoWidth, height: v.videoHeight, audioBytes: v.webkitAudioDecodedByteCount, time: v.currentTime };
+            return {
+                duration: v.duration, width: v.videoWidth, height: v.videoHeight,
+                audioBytes: v.webkitAudioDecodedByteCount ?? (v.mozHasAudio ? 1 : 0), time: v.currentTime,
+                // Есть ли вообще декодер H.264 (у безголового Firefox его может не быть).
+                h264: v.canPlayType('video/mp4; codecs="avc1.42E01E"')
+            };
         });
         await p.close();
-        console.log(`воспроизведение ${name}: ${r.duration.toFixed(1)} с, ${r.width}x${r.height}, звук ${r.audioBytes} Б, после перемотки ${r.time.toFixed(1)} с`);
+        console.log(`воспроизведение ${name}: ${r.duration.toFixed(1)} с, ${r.width}x${r.height}, звук ${r.audioBytes > 1 ? `${r.audioBytes} Б` : (r.audioBytes ? "есть" : "нет")}, после перемотки ${r.time.toFixed(1)} с${r.width ? '' : `, H.264: «${r.h264}»`}`);
         if (!r.width || !r.audioBytes) throw new Error(`${name}: нет изображения или звука`);
         if (r.time < r.duration * 0.5) throw new Error(`${name}: перемотка не сработала`);
         return r;
@@ -291,11 +337,17 @@ try {
     };
 
     // «Открыть папку» на самом деле открыла бы Проводник — подменяем вызовы и записываем их.
-    const stubOpenFolder = () => popup.evaluate(() => {
-        window.__opened = [];
-        chrome.downloads.show = id => window.__opened.push(['show', id]);
-        chrome.downloads.showDefaultFolder = () => window.__opened.push(['default']);
-    });
+    const stubOpenFolder = async () => {
+        const stubbed = await popup.evaluate(() => {
+            window.__opened = [];
+            const downloads = (globalThis.browser ?? chrome).downloads;
+            Object.defineProperty(downloads, 'show', { value: id => window.__opened.push(['show', id]), configurable: true });
+            Object.defineProperty(downloads, 'showDefaultFolder', { value: () => window.__opened.push(['default']), configurable: true });
+            return String(downloads.show).includes('__opened') && String(downloads.showDefaultFolder).includes('__opened');
+        });
+        // Иначе кнопка по-настоящему откроет Проводник.
+        if (!stubbed) throw new Error('не удалось подменить downloads.show — проверка «Открыть папку» пропущена бы небезопасно');
+    };
     const clickOpenFolder = async () => {
         await popup.click('#openFolderBtn');
         await popup.waitForFunction(() => window.__opened.length > 0);
@@ -311,34 +363,38 @@ try {
     console.log('«Открыть папку» без загрузок:', before);
     if (before[0] !== 'default') throw new Error('без загрузок должна открываться папка «Загрузки»');
 
-    // 2. Дважды одно и то же: второй файл должен получить имя «… (1).mp4», а не затереть первый.
+    // 2. Дважды одно и то же: второй файл должен получить имя «… (1).mp4», а не затереть первый
+    // (Firefox пишет «…(1).mp4» без пробела).
+    const SECOND = / ?\(1\)\.mp4$/;
     await download('184');
     if (args.screenshot) {
         await popup.setViewport({ width: 380, height: 400 });
         await popup.screenshot({ path: args.screenshot, fullPage: true });
     }
     await download('184');
+    // Сразу, пока готовая карточка не пропала (она видна несколько секунд).
+    const topTitle = await popup.$eval('#jobs .card .card-title', el => el.textContent);
+    if (!SECOND.test(topTitle)) throw new Error(`карточка должна показывать итоговое имя, а там «${topTitle}»`);
     const sub = path.join(downloads, 'VideoLoader');
     const files = fs.existsSync(sub) ? fs.readdirSync(sub).sort() : [];
     console.log('в Загрузки/VideoLoader:', files);
-    if (files.length !== 2 || !files.some(f => f.endsWith(' (1).mp4'))) throw new Error('ожидались два файла, второй — с «(1)»');
+    if (files.length !== 2 || !files.some(f => SECOND.test(f))) throw new Error('ожидались два файла, второй — с «(1)»');
     for (const f of files) checkMp4(f, fs.readFileSync(path.join(sub, f)));
     await playCheck('hls.mp4', fs.readFileSync(path.join(sub, files[0])));
     if (fs.readdirSync(downloads).length !== 1) throw new Error('в корне «Загрузок» не должно быть файлов');
-    const topTitle = await popup.$eval('#jobs .card .card-title', el => el.textContent);
-    if (!topTitle.endsWith(' (1).mp4')) throw new Error(`карточка должна показывать итоговое имя, а там «${topTitle}»`);
 
     // 3. Теперь «Открыть папку» показывает последнее видео — то есть открывает его папку.
-    const lastId = await worker.evaluate(async () => (await chrome.downloads.search({ orderBy: ['-startTime'], limit: 1 }))[0].id);
+    const lastId = await worker.evaluate(async () => (await (globalThis.browser ?? chrome).downloads.search({ orderBy: ['-startTime'], limit: 1 }))[0].id);
     const after = await clickOpenFolder();
     console.log('«Открыть папку» после загрузок:', after, 'последняя загрузка:', lastId);
     if (after[0] !== 'show' || after[1] !== lastId) throw new Error('кнопка должна показать последнее сохранённое видео');
 
     // 4. Ошибка не пропадает сама — только по «Убрать».
     await worker.evaluate(async () => {
-        const { jobs = {} } = await chrome.storage.session.get('jobs');
+        const api = globalThis.browser ?? chrome;
+        const { jobs = {} } = await api.storage.session.get('jobs');
         jobs.failed = { id: 'failed', title: 'Сломанное видео', status: 'error', note: 'плейлист недоступен (HTTP 403)', startedAt: Date.now(), finishedAt: Date.now() - 60000 };
-        await chrome.storage.session.set({ jobs });
+        await api.storage.session.set({ jobs });
     });
     await popup.waitForFunction(() => /Сломанное видео/.test(document.getElementById('jobs').innerText));
     const errorCard = await popup.$eval('#jobs .card', el => el.innerText.replace(/\n/g, ' | '));

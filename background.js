@@ -3,10 +3,12 @@
  *   - следит за запросами вкладок и запоминает найденные видео (HLS-плейлисты,
  *     DASH-манифесты и обычные файлы) вместе с заголовками Referer/Origin,
  *     с которыми их запросил плеер;
- *   - ставит правила declarativeNetRequest, чтобы запросы расширения к CDN шли
- *     с теми же заголовками (правила касаются только запросов самого расширения);
- *   - запускает загрузки в offscreen-документе: он живёт независимо от попапа,
- *     поэтому закрытие попапа загрузку не прерывает;
+ *   - подставляет те же заголовки в запросы расширения к CDN (только в запросы
+ *     самого расширения): в Chrome — правилами declarativeNetRequest, в Firefox —
+ *     блокирующим webRequest;
+ *   - запускает загрузки (js/downloader.js): в Chrome — в offscreen-документе, он
+ *     живёт независимо от попапа; в Firefox offscreen нет, зато фоновая страница
+ *     постоянная (manifest.firefox.json) — загрузчик работает прямо здесь;
  *   - сохраняет готовый файл в «Загрузки» (в offscreen-документе нет downloads API).
  *
  * Состояние лежит в storage.session: попап читает его и следит за изменениями.
@@ -15,11 +17,15 @@
  *   rules    — домен → id правила заголовков.
  */
 
+import { createDownloader } from './js/downloader.js';
 import { classifyMedia, headerValue, MIN_FILE_SIZE, responseSize } from './js/sniffer.js';
 import { ruleDomain } from './js/net-rules.js';
-import { sanitizeFileName } from './js/util.js';
+import { ext as api, sanitizeFileName } from './js/util.js';
 
-const api = globalThis.chrome;
+/** Firefox (API getBrowserInfo есть только там). */
+const IS_FIREFOX = typeof api.runtime.getBrowserInfo === 'function';
+/** Значок: action в MV3 (Chrome), browserAction в MV2 (Firefox). */
+const action = api.action ?? api.browserAction;
 const TYPES = ['xmlhttprequest', 'media', 'other'];
 const MAX_ITEMS = 40;
 const OFFSCREEN_URL = 'offscreen.html';
@@ -52,7 +58,8 @@ api.webRequest.onSendHeaders.addListener(d => {
         Origin: headerValue(d.requestHeaders, 'origin') || null
     });
     if (requestHeaders.size > 500) requestHeaders.delete(requestHeaders.keys().next().value);
-}, { urls: ['<all_urls>'], types: TYPES }, ['requestHeaders', 'extraHeaders']);
+// В Chrome Referer и Origin видны только с extraHeaders; Firefox такой опции не знает.
+}, { urls: ['<all_urls>'], types: TYPES }, ['requestHeaders', ...(api.webRequest.OnSendHeadersOptions?.EXTRA_HEADERS ? ['extraHeaders'] : [])]);
 
 api.webRequest.onResponseStarted.addListener(d => {
     if (d.tabId < 0) return;
@@ -73,7 +80,7 @@ api.webRequest.onResponseStarted.addListener(d => {
         url: d.url,
         kind,
         size,
-        headers: headers || { Referer: d.initiator ? `${d.initiator}/` : null, Origin: null },
+        headers: headers || { Referer: pageOrigin(d) ? `${pageOrigin(d)}/` : null, Origin: null },
         time: Date.now()
     });
 }, { urls: ['<all_urls>'], types: [...TYPES, 'main_frame'] }, ['responseHeaders']);
@@ -81,6 +88,16 @@ api.webRequest.onResponseStarted.addListener(d => {
 api.webRequest.onErrorOccurred.addListener(d => requestHeaders.delete(d.requestId), { urls: ['<all_urls>'], types: TYPES });
 
 api.tabs.onRemoved.addListener(tabId => forgetTab(tabId));
+
+/** Откуда запрос: initiator в Chrome, originUrl в Firefox. */
+function pageOrigin(d) {
+    if (d.initiator) return d.initiator;
+    try {
+        return d.originUrl ? new URL(d.originUrl).origin : null;
+    } catch {
+        return null;
+    }
+}
 
 function addMedia(tabId, item) {
     return serial(async () => {
@@ -108,11 +125,11 @@ function forgetTab(tabId) {
 }
 
 async function setBadge(tabId, count) {
-    await api.action.setBadgeText({ tabId, text: count ? String(count) : '' }).catch(() => {});
+    await Promise.resolve(action.setBadgeText({ tabId, text: count ? String(count) : '' })).catch(() => {});
 }
 
 api.runtime.onInstalled.addListener(() => {
-    api.action.setBadgeBackgroundColor({ color: '#28b35e' });
+    action.setBadgeBackgroundColor({ color: '#28b35e' });
 });
 
 // --- Заголовки для запросов расширения ------------------------------------------------
@@ -123,6 +140,10 @@ api.runtime.onInstalled.addListener(() => {
  *   расширения там, где плеер Origin не отправлял).
  */
 function setHeaderRule(domain, headers) {
+    if (IS_FIREFOX) {
+        if (headers && Object.keys(headers).length) firefoxRules.set(domain, headers);
+        return Promise.resolve();
+    }
     return serial(async () => {
         const requestHeaders = Object.entries(headers || {}).map(([header, value]) =>
             value ? { header, operation: 'set', value } : { header, operation: 'remove' });
@@ -151,6 +172,27 @@ function setHeaderRule(domain, headers) {
     });
 }
 
+/**
+ * Firefox: правила заголовков — в памяти фоновой страницы (она постоянная),
+ * домен → заголовки. Применяются только к запросам со страниц самого расширения.
+ * @type {Map<string, Record<string, ?string>>}
+ */
+const firefoxRules = new Map();
+
+if (IS_FIREFOX) {
+    const extensionOrigin = api.runtime.getURL('');
+    api.webRequest.onBeforeSendHeaders.addListener(d => {
+        if (!(d.originUrl || d.documentUrl || '').startsWith(extensionOrigin)) return {};
+        const host = new URL(d.url).hostname;
+        const rule = [...firefoxRules].find(([domain]) => host === domain || host.endsWith(`.${domain}`));
+        if (!rule) return {};
+        const names = new Set(Object.keys(rule[1]).map(n => n.toLowerCase()));
+        const requestHeaders = d.requestHeaders.filter(h => !names.has(h.name.toLowerCase()));
+        for (const [name, value] of Object.entries(rule[1])) if (value) requestHeaders.push({ name, value });
+        return { requestHeaders };
+    }, { urls: ['<all_urls>'] }, ['blocking', 'requestHeaders']);
+}
+
 // --- Загрузки -----------------------------------------------------------------------
 
 /** Через сколько забывать готовые и остановленные загрузки (истории нет, ошибки — до «Убрать»). */
@@ -169,6 +211,9 @@ function updateJob(id, patch) {
         await api.storage.session.set({ jobs });
     });
 }
+
+/** Firefox: загрузчик на самой фоновой странице; с фоном он говорит прямыми вызовами. */
+const localDownloader = api.offscreen ? null : createDownloader(msg => callHandler(msg));
 
 let creatingOffscreen = null;
 async function ensureOffscreen() {
@@ -191,9 +236,13 @@ async function startDownload({ media, title, maxHeight, keepTs }) {
     await updateJob(id, job);
     try {
         await setHeaderRule(ruleDomain(media.url), media.headers);
-        await ensureOffscreen();
-        const res = await api.runtime.sendMessage({ target: 'offscreen', type: 'start', job, media, maxHeight, keepTs });
-        if (!res?.ok) throw new Error('фоновый загрузчик не ответил');
+        if (localDownloader) {
+            localDownloader.start({ job, media, maxHeight, keepTs });
+        } else {
+            await ensureOffscreen();
+            const res = await api.runtime.sendMessage({ target: 'offscreen', type: 'start', job, media, maxHeight, keepTs });
+            if (!res?.ok) throw new Error('фоновый загрузчик не ответил');
+        }
     } catch (e) {
         await updateJob(id, { status: 'error', note: e.message });
     }
@@ -202,7 +251,9 @@ async function startDownload({ media, title, maxHeight, keepTs }) {
 
 async function cancelDownload(id) {
     let res = null;
-    if (await api.offscreen.hasDocument()) {
+    if (localDownloader) {
+        res = { ok: localDownloader.cancel(id) };
+    } else if (await api.offscreen.hasDocument()) {
         res = await api.runtime.sendMessage({ target: 'offscreen', type: 'cancel', id }).catch(() => null);
     }
     // Загрузчика уже нет (например, offscreen-документ закрылся) — просто помечаем.
@@ -252,12 +303,15 @@ const handlers = {
     save: saveFile
 };
 
+/** Обработать сообщение; ответ — результат или { error }. */
+function callHandler(msg) {
+    return Promise.resolve()
+        .then(() => handlers[msg.type](msg))
+        .then(result => result ?? { ok: true }, e => ({ error: e?.message || String(e) }));
+}
+
 api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-    const handler = msg?.target ? null : handlers[msg?.type];
-    if (!handler) return false;
-    Promise.resolve(handler(msg)).then(
-        result => sendResponse(result ?? { ok: true }),
-        e => sendResponse({ error: e?.message || String(e) })
-    );
+    if (msg?.target || !handlers[msg?.type]) return false;
+    callHandler(msg).then(sendResponse);
     return true;
 });

@@ -1,0 +1,42 @@
+{
+    "manifest_version": 2,
+    "name": "VideoLoader",
+    "version": "0.2.0",
+    "description": "Скачивает видео с открытой страницы: HLS-потоки (m3u8), DASH и обычные видеофайлы.",
+    "browser_specific_settings": {
+        "gecko": {
+            "id": "videoloader@noname316",
+            "strict_min_version": "115.0",
+            "data_collection_permissions": {
+                "required": ["none"]
+            }
+        }
+    },
+    "background": {
+        "page": "background.html",
+        "persistent": true
+    },
+    "browser_action": {
+        "default_title": "VideoLoader — скачать видео со страницы",
+        "default_popup": "popup.html",
+        "default_icon": {
+            "16": "icons/icon16.png",
+            "32": "icons/icon32.png",
+            "48": "icons/icon48.png"
+        }
+    },
+    "icons": {
+        "16": "icons/icon16.png",
+        "32": "icons/icon32.png",
+        "48": "icons/icon48.png",
+        "128": "icons/icon128.png"
+    },
+    "permissions": [
+        "webRequest",
+        "webRequestBlocking",
+        "storage",
+        "downloads",
+        "unlimitedStorage",
+        "<all_urls>"
+    ]
+}
