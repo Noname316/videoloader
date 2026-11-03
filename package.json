@@ -1,0 +1,14 @@
+{
+    "name": "videoloader",
+    "version": "0.1.0",
+    "private": true,
+    "description": "Браузерное расширение: скачивание видео с открытой страницы (HLS и обычные файлы)",
+    "type": "module",
+    "scripts": {
+        "e2e": "node tests/e2e.mjs",
+        "icons": "node tests/make-icons.mjs"
+    },
+    "devDependencies": {
+        "puppeteer-core": "^24.43.1"
+    }
+}

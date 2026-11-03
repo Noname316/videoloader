@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <title>VideoLoader</title>
+    <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+<header>
+    <span class="logo">Video<b>Loader</b></span>
+    <span id="pageHost" class="muted"></span>
+</header>
+
+<section>
+    <h2>Видео на странице</h2>
+    <div id="media" class="list"></div>
+    <p id="loading" class="hint hidden">Проверяю найденные потоки…</p>
+    <p id="empty" class="hint hidden">
+        Пока ничего не найдено. Запустите видео — расширение увидит поток, когда плеер начнёт
+        его загружать. Если страница была открыта до установки расширения, обновите её.
+    </p>
+</section>
+
+<section id="jobsSection" class="hidden">
+    <h2>Загрузки</h2>
+    <div id="jobs" class="list"></div>
+    <p id="jobsHint" class="hint">Попап можно закрыть — загрузка продолжится.</p>
+</section>
+
+<footer>
+    <div class="folder-row">
+        <span class="muted">Сохраняется в</span>
+        <span id="folderName" class="folder-name">Загрузки</span>
+        <button type="button" id="openFolderBtn" class="secondary small">Открыть папку</button>
+    </div>
+    <label class="check"><input type="checkbox" id="keepTs"> MPEG-TS сохранять как .ts, без перепаковки в MP4</label>
+</footer>
+
+<script src="lib/m3u8-parser.min.js"></script>
+<script type="module" src="js/popup.js"></script>
+</body>
+</html>
